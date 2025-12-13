@@ -1,5 +1,5 @@
 # ============================================================================
-# ALGORITHMIC TRADING SYSTEM
+# ALGORITHMIC TRADING SYSTEM WITH VECTORBT
 # ============================================================================
 # Features:
 # 1. Three technical strategies (MA Crossover, RSI, MACD)
@@ -15,13 +15,11 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
-# Backtesting framework
-from backtesting import Backtest, Strategy
-from backtesting.lib import crossover, resample_apply
+# VectorBT for backtesting
+import vectorbt as vbt
 
 plt.style.use('seaborn-v0_8-darkgrid')
 sns.set_palette("husl")
@@ -33,657 +31,431 @@ sns.set_palette("husl")
 class DataFetcher:
     """Data collection and preprocessing module"""
     
-    def __init__(self, start_date: str = "2010-01-01", end_date: str = None):
+    def __init__(self, start_date: str = "2015-01-01", end_date: str = None):
         self.start_date = start_date
         self.end_date = end_date or datetime.now().strftime("%Y-%m-%d")
         self.assets = {
             'GLD': 'Gold (ETF Proxy)',
-            'USO': 'Crude Oil (ETF Proxy)',
-            'SPY': 'S&P 500 (ETF Proxy)'
+            'CL=F': 'Crude Oil Futures',
+            'ES=F': 'S&P 500 Futures'
         }
         
-        # Macro indicators
-        self.macro_indicators = {
-            '^TNX': '10-Year Treasury Yield',
-            '^TYX': '30-Year Treasury Yield',
-            'TIP': 'TIPS (Inflation-Protected)',
-            'DXY': 'US Dollar Index'
+        # Alternative assets if futures don't work
+        self.alt_assets = {
+            'GLD': 'Gold',
+            'USO': 'Crude Oil ETF',
+            'SPY': 'S&P 500 ETF'
         }
     
-    def fetch_price_data(self, symbols: List[str]) -> pd.DataFrame:
+    def fetch_price_data(self, symbols: dict) -> dict:
         """Fetch OHLCV data for given symbols"""
-        data = {}
-        for symbol in symbols:
+        data_dict = {}
+        
+        for symbol, description in symbols.items():
             try:
+                print(f"Fetching {symbol} ({description})...")
                 ticker = yf.Ticker(symbol)
                 df = ticker.history(start=self.start_date, end=self.end_date)
+                
                 if not df.empty:
-                    data[symbol] = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-                    print(f"✓ Fetched {symbol}: {len(df)} rows from {df.index[0].date()} to {df.index[-1].date()}")
+                    # Ensure we have all required columns
+                    df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+                    df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+                    data_dict[symbol] = df
+                    print(f"  ✓ {len(df)} rows from {df.index[0].date()} to {df.index[-1].date()}")
                 else:
-                    print(f"✗ No data for {symbol}")
+                    print(f"  ✗ No data for {symbol}")
             except Exception as e:
-                print(f"✗ Error fetching {symbol}: {e}")
+                print(f"  ✗ Error fetching {symbol}: {e}")
         
-        # Combine into multi-index DataFrame
-        if data:
-            combined = pd.concat(data, axis=1, keys=data.keys())
-            combined.columns.names = ['Symbol', 'PriceType']
-            return combined
-        return pd.DataFrame()
+        return data_dict
     
-    def fetch_macro_data(self) -> pd.DataFrame:
-        """Fetch macroeconomic data"""
-        macro_data = {}
-        for symbol, description in self.macro_indicators.items():
-            try:
-                ticker = yf.Ticker(symbol)
-                df = ticker.history(start=self.start_date, end=self.end_date)
-                if not df.empty:
-                    macro_data[symbol] = df['Close']
-                    print(f"✓ Fetched macro {symbol}: {len(df)} rows")
-            except:
-                print(f"✗ Could not fetch {symbol}")
+    def create_features(self, price_data: pd.DataFrame) -> pd.DataFrame:
+        """Create technical indicators and features"""
+        df = price_data.copy()
         
-        return pd.DataFrame(macro_data) if macro_data else pd.DataFrame()
-    
-    def calculate_returns(self, price_data: pd.DataFrame) -> pd.DataFrame:
-        """Calculate returns and technical indicators"""
-        returns_data = {}
+        # Price returns
+        df['Returns'] = df['Close'].pct_change()
+        df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
         
-        for symbol in price_data.columns.get_level_values(0).unique():
-            df = price_data[symbol].copy()
-            
-            # Returns
-            df['Returns'] = df['Close'].pct_change()
-            df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
-            
-            # Volatility
-            df['Volatility_20d'] = df['Returns'].rolling(window=20).std() * np.sqrt(252)
-            
-            # Volume indicators
-            df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
-            df['Volume_Ratio'] = df['Volume'] / df['Volume_MA']
-            
-            returns_data[symbol] = df
+        # Moving averages
+        df['SMA_20'] = df['Close'].rolling(window=20).mean()
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
+        df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
         
-        return pd.concat(returns_data, axis=1)
-
-# ============================================================================
-# TECHNICAL INDICATORS MODULE
-# ============================================================================
-
-class TechnicalIndicators:
-    """Technical indicators calculation"""
-    
-    @staticmethod
-    def calculate_sma(series: pd.Series, window: int) -> pd.Series:
-        return series.rolling(window=window).mean()
-    
-    @staticmethod
-    def calculate_ema(series: pd.Series, window: int) -> pd.Series:
-        return series.ewm(span=window, adjust=False).mean()
-    
-    @staticmethod
-    def calculate_rsi(series: pd.Series, window: int = 14) -> pd.Series:
-        """Calculate Relative Strength Index"""
-        delta = series.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+        # RSI
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
-    
-    @staticmethod
-    def calculate_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple:
-        """Calculate MACD line, signal line, and histogram"""
-        ema_fast = series.ewm(span=fast, adjust=False).mean()
-        ema_slow = series.ewm(span=slow, adjust=False).mean()
-        macd_line = ema_fast - ema_slow
-        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-        histogram = macd_line - signal_line
-        return macd_line, signal_line, histogram
-    
-    @staticmethod
-    def calculate_bollinger_bands(series: pd.Series, window: int = 20, num_std: float = 2) -> Tuple:
-        """Calculate Bollinger Bands"""
-        sma = series.rolling(window=window).mean()
-        std = series.rolling(window=window).std()
-        upper_band = sma + (std * num_std)
-        lower_band = sma - (std * num_std)
-        return upper_band, sma, lower_band
-    
-    @staticmethod
-    def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
-        """Calculate Average True Range"""
-        tr1 = high - low
-        tr2 = abs(high - close.shift())
-        tr3 = abs(low - close.shift())
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.rolling(window=window).mean()
-        return atr
-
-# ============================================================================
-# TRADING STRATEGIES
-# ============================================================================
-
-# Base Strategy with common functionality
-class BaseStrategy(Strategy):
-    """Base strategy with common risk management features"""
-    
-    def init(self):
-        # Initialize common indicators
-        super().init()
+        df['RSI'] = 100 - (100 / (1 + rs))
         
-    def set_stop_loss(self, price: float, atr: float = None, 
-                     stop_percent: float = 0.02, atr_multiplier: float = 2) -> float:
-        """Dynamic stop loss calculation"""
-        if atr is not None and atr > 0:
-            # ATR-based stop loss
-            return price - (atr * atr_multiplier)
+        # MACD
+        df['MACD'] = df['EMA_12'] - df['EMA_26']
+        df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+        
+        # Bollinger Bands
+        df['BB_Middle'] = df['Close'].rolling(window=20).mean()
+        bb_std = df['Close'].rolling(window=20).std()
+        df['BB_Upper'] = df['BB_Middle'] + 2 * bb_std
+        df['BB_Lower'] = df['BB_Middle'] - 2 * bb_std
+        
+        # ATR for volatility
+        high_low = df['High'] - df['Low']
+        high_close = abs(df['High'] - df['Close'].shift())
+        low_close = abs(df['Low'] - df['Close'].shift())
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df['ATR'] = tr.rolling(window=14).mean()
+        
+        # Volume indicators
+        df['Volume_SMA'] = df['Volume'].rolling(window=20).mean()
+        df['Volume_Ratio'] = df['Volume'] / df['Volume_SMA']
+        
+        # Volatility
+        df['Volatility_20d'] = df['Returns'].rolling(window=20).std() * np.sqrt(252)
+        
+        return df
+
+# ============================================================================
+# TRADING STRATEGIES MODULE
+# ============================================================================
+
+class TradingStrategies:
+    """Implementation of trading strategies"""
+    
+    @staticmethod
+    def ma_crossover_strategy(close, sma_short, sma_long):
+        """Moving Average Crossover Strategy"""
+        # Generate signals: 1 for long, -1 for short, 0 for neutral
+        signals = pd.Series(0, index=close.index)
+        
+        # Long when short MA crosses above long MA
+        long_condition = (sma_short > sma_long) & (sma_short.shift(1) <= sma_long.shift(1))
+        
+        # Short when short MA crosses below long MA
+        short_condition = (sma_short < sma_long) & (sma_short.shift(1) >= sma_long.shift(1))
+        
+        signals[long_condition] = 1
+        signals[short_condition] = -1
+        
+        return signals
+    
+    @staticmethod
+    def rsi_strategy(close, rsi, oversold=30, overbought=70):
+        """RSI Mean Reversion Strategy"""
+        signals = pd.Series(0, index=close.index)
+        
+        # Buy when RSI crosses above oversold level
+        buy_condition = (rsi > oversold) & (rsi.shift(1) <= oversold)
+        
+        # Sell when RSI crosses below overbought level
+        sell_condition = (rsi < overbought) & (rsi.shift(1) >= overbought)
+        
+        signals[buy_condition] = 1
+        signals[sell_condition] = -1
+        
+        return signals
+    
+    @staticmethod
+    def macd_strategy(close, macd_line, signal_line):
+        """MACD Crossover Strategy"""
+        signals = pd.Series(0, index=close.index)
+        
+        # Buy when MACD crosses above signal line
+        buy_condition = (macd_line > signal_line) & (macd_line.shift(1) <= signal_line.shift(1))
+        
+        # Sell when MACD crosses below signal line
+        sell_condition = (macd_line < signal_line) & (macd_line.shift(1) >= signal_line.shift(1))
+        
+        signals[buy_condition] = 1
+        signals[sell_condition] = -1
+        
+        return signals
+    
+    @staticmethod
+    def macro_strategy(close, volatility, volume_ratio, market_regime='normal'):
+        """Macro-driven strategy using market conditions"""
+        signals = pd.Series(0, index=close.index)
+        
+        # Simplified macro strategy
+        # In risk-on environment: long equities
+        # In risk-off environment: long gold/short equities
+        
+        # Determine market regime based on volatility and volume
+        high_vol = volatility > volatility.quantile(0.75)
+        high_volume = volume_ratio > 1.5
+        
+        if 'GLD' in close.name or 'Gold' in str(close.name):
+            # Gold strategy: Buy during high volatility (safe haven)
+            signals[high_vol] = 1
+            signals[~high_vol] = 0
+            
+        elif 'SPY' in close.name or 'ES' in str(close.name):
+            # Equity strategy: Buy in normal/low vol, sell in high vol
+            signals[~high_vol & high_volume] = 1
+            signals[high_vol] = -1
+            
+        elif 'USO' in close.name or 'CL' in str(close.name):
+            # Oil strategy: More complex macro factors
+            # Simplified: Buy when volume is high (institutional interest)
+            signals[high_volume] = 1
+            signals[~high_volume] = 0
+        
+        return signals
+
+# ============================================================================
+# BACKTESTING ENGINE WITH VECTORBT
+# ============================================================================
+
+class BacktestEngineVBT:
+    """Backtesting engine using VectorBT"""
+    
+    def __init__(self, initial_capital=100000, commission=0.001):
+        self.initial_capital = initial_capital
+        self.commission = commission
+        self.results = {}
+        
+    def run_strategy(self, price_data: pd.DataFrame, 
+                    signals: pd.Series, 
+                    strategy_name: str,
+                    stop_loss_pct: float = 0.05,
+                    take_profit_pct: float = 0.10) -> vbt.Portfolio:
+        """Run a single strategy backtest"""
+        
+        # Create portfolio with signals
+        portfolio = vbt.Portfolio.from_signals(
+            close=price_data['Close'],
+            entries=signals == 1,
+            exits=signals == -1,
+            init_cash=self.initial_capital,
+            fees=self.commission,
+            sl_stop=stop_loss_pct,  # 5% stop loss
+            tp_stop=take_profit_pct,  # 10% take profit
+            freq='D'
+        )
+        
+        # Store results
+        self.results[strategy_name] = {
+            'portfolio': portfolio,
+            'signals': signals,
+            'returns': portfolio.returns(),
+            'equity': portfolio.value()
+        }
+        
+        return portfolio
+    
+    def calculate_performance_metrics(self, portfolio: vbt.Portfolio) -> dict:
+        """Calculate comprehensive performance metrics"""
+        
+        # Basic metrics from vectorbt
+        stats = portfolio.stats()
+        
+        # Additional calculations
+        returns = portfolio.returns()
+        equity = portfolio.value()
+        
+        # Sortino Ratio
+        downside_returns = returns[returns < 0]
+        downside_std = downside_returns.std() * np.sqrt(252)
+        sortino = returns.mean() * 252 / downside_std if downside_std != 0 else 0
+        
+        # Max Drawdown
+        rolling_max = equity.expanding().max()
+        drawdown = (equity - rolling_max) / rolling_max
+        max_dd = drawdown.min()
+        
+        # CAGR
+        years = len(equity) / 252
+        cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1/years) - 1 if years > 0 else 0
+        
+        # Calmar Ratio
+        calmar = cagr / abs(max_dd) if max_dd != 0 else 0
+        
+        # Win rate
+        trades = portfolio.trades.records_readable
+        if len(trades) > 0:
+            win_rate = (trades['PnL'] > 0).mean() * 100
+            avg_win = trades[trades['PnL'] > 0]['PnL'].mean() if len(trades[trades['PnL'] > 0]) > 0 else 0
+            avg_loss = trades[trades['PnL'] < 0]['PnL'].mean() if len(trades[trades['PnL'] < 0]) > 0 else 0
+            profit_factor = abs(avg_win / avg_loss) if avg_loss != 0 else np.inf
         else:
-            # Percentage-based stop loss
-            return price * (1 - stop_percent)
-    
-    def set_take_profit(self, price: float, risk_reward: float = 2, 
-                       stop_loss: float = None) -> float:
-        """Take profit based on risk-reward ratio"""
-        if stop_loss is not None:
-            risk = price - stop_loss
-            return price + (risk * risk_reward)
-        return price * 1.04  # Default 4% take profit
-    
-    def calculate_position_size(self, capital: float, price: float, 
-                              stop_loss: float = None, risk_per_trade: float = 0.01) -> int:
-        """Kelly-inspired position sizing with risk management"""
-        if stop_loss is None:
-            # Default 2% stop loss
-            stop_loss = price * 0.98
+            win_rate = avg_win = avg_loss = profit_factor = 0
         
-        risk_per_share = price - stop_loss
+        metrics = {
+            'Total Return (%)': stats['Total Return [%]'],
+            'CAGR (%)': cagr * 100,
+            'Sharpe Ratio': stats['Sharpe Ratio'],
+            'Sortino Ratio': sortino,
+            'Calmar Ratio': calmar,
+            'Max Drawdown (%)': max_dd * 100,
+            'Win Rate (%)': win_rate,
+            'Profit Factor': profit_factor,
+            'Total Trades': stats['Total Trades'],
+            'Avg Win/Loss': avg_win / abs(avg_loss) if avg_loss != 0 else np.inf
+        }
+        
+        return metrics
+    
+    def plot_results(self, portfolio: vbt.Portfolio, asset_name: str, strategy_name: str):
+        """Plot backtest results"""
+        fig = plt.figure(figsize=(15, 10))
+        fig.suptitle(f'{asset_name} - {strategy_name} Performance', fontsize=16)
+        
+        # Create subplots
+        gs = fig.add_gridspec(3, 3)
+        
+        # Equity curve
+        ax1 = fig.add_subplot(gs[0, :])
+        portfolio.value().vbt.plot(ax=ax1, title='Equity Curve')
+        ax1.set_ylabel('Portfolio Value ($)')
+        
+        # Drawdown
+        ax2 = fig.add_subplot(gs[1, 0])
+        portfolio.drawdown().vbt.plot(ax=ax2, title='Drawdown')
+        ax2.set_ylabel('Drawdown (%)')
+        
+        # Monthly returns
+        ax3 = fig.add_subplot(gs[1, 1])
+        monthly_returns = portfolio.returns().resample('M').apply(lambda x: (1 + x).prod() - 1)
+        monthly_returns.vbt.barplot(ax=ax3, title='Monthly Returns')
+        ax3.set_ylabel('Return (%)')
+        
+        # Daily returns distribution
+        ax4 = fig.add_subplot(gs[1, 2])
+        portfolio.returns().vbt.histplot(ax=ax4, title='Daily Returns Distribution')
+        ax4.set_xlabel('Daily Return')
+        
+        # Trades
+        ax5 = fig.add_subplot(gs[2, :])
+        portfolio.trades.plot(ax=ax5, title='Trades')
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def plot_compare_strategies(self, strategies_data: dict, asset_name: str):
+        """Compare multiple strategies for the same asset"""
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        fig.suptitle(f'{asset_name} - Strategy Comparison', fontsize=16)
+        
+        # Equity curves comparison
+        ax1 = axes[0, 0]
+        for strategy_name, data in strategies_data.items():
+            if 'portfolio' in data:
+                data['portfolio'].value().vbt.plot(ax=ax1, label=strategy_name)
+        ax1.set_title('Equity Curves')
+        ax1.legend()
+        ax1.set_ylabel('Portfolio Value')
+        
+        # Sharpe ratio comparison
+        ax2 = axes[0, 1]
+        sharpe_ratios = []
+        strategy_names = []
+        for strategy_name, data in strategies_data.items():
+            if 'portfolio' in data:
+                sharpe = data['portfolio'].sharpe_ratio()
+                sharpe_ratios.append(sharpe)
+                strategy_names.append(strategy_name)
+        ax2.bar(strategy_names, sharpe_ratios)
+        ax2.set_title('Sharpe Ratios')
+        ax2.set_ylabel('Sharpe Ratio')
+        
+        # Max drawdown comparison
+        ax3 = axes[1, 0]
+        max_dds = []
+        for strategy_name, data in strategies_data.items():
+            if 'portfolio' in data:
+                max_dd = data['portfolio'].max_drawdown()
+                max_dds.append(max_dd * 100)
+        ax3.bar(strategy_names, max_dds, color='red', alpha=0.6)
+        ax3.set_title('Maximum Drawdown')
+        ax3.set_ylabel('Drawdown (%)')
+        
+        # Win rate comparison
+        ax4 = axes[1, 1]
+        win_rates = []
+        for strategy_name, data in strategies_data.items():
+            if 'portfolio' in data:
+                trades = data['portfolio'].trades.records_readable
+                if len(trades) > 0:
+                    win_rate = (trades['PnL'] > 0).mean() * 100
+                else:
+                    win_rate = 0
+                win_rates.append(win_rate)
+        ax4.bar(strategy_names, win_rates, color='green', alpha=0.6)
+        ax4.set_title('Win Rate')
+        ax4.set_ylabel('Win Rate (%)')
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def generate_trade_report(self, portfolio: vbt.Portfolio, strategy_name: str):
+        """Generate detailed trade report"""
+        trades = portfolio.trades.records_readable
+        
+        if len(trades) == 0:
+            print(f"No trades executed for {strategy_name}")
+            return
+        
+        print(f"\n{'='*60}")
+        print(f"TRADE REPORT: {strategy_name}")
+        print(f"{'='*60}")
+        print(f"Total Trades: {len(trades)}")
+        print(f"Win Rate: {(trades['PnL'] > 0).mean()*100:.1f}%")
+        print(f"Total PnL: ${trades['PnL'].sum():.2f}")
+        print(f"Average PnL: ${trades['PnL'].mean():.2f}")
+        print(f"Best Trade: ${trades['PnL'].max():.2f}")
+        print(f"Worst Trade: ${trades['PnL'].min():.2f}")
+        
+        # Show recent trades
+        print(f"\nLast 5 Trades:")
+        print("-"*60)
+        recent_trades = trades.tail(5)
+        for idx, trade in recent_trades.iterrows():
+            direction = "LONG" if trade['Size'] > 0 else "SHORT"
+            print(f"Entry: {trade['Entry Date']} @ ${trade['Entry Price']:.2f}")
+            print(f"Exit:  {trade['Exit Date']} @ ${trade['Exit Price']:.2f}")
+            print(f"PnL: ${trade['PnL']:.2f} ({trade['Return']*100:.2f}%) | {direction}")
+            print(f"Duration: {trade['Duration']}")
+            print("-"*40)
+
+# ============================================================================
+# RISK MANAGEMENT MODULE
+# ============================================================================
+
+class RiskManager:
+    """Risk management utilities"""
+    
+    @staticmethod
+    def calculate_var(returns: pd.Series, confidence_level: float = 0.95) -> float:
+        """Calculate Value at Risk"""
+        return np.percentile(returns, 100 * (1 - confidence_level))
+    
+    @staticmethod
+    def calculate_cvar(returns: pd.Series, confidence_level: float = 0.95) -> float:
+        """Calculate Conditional Value at Risk (Expected Shortfall)"""
+        var = RiskManager.calculate_var(returns, confidence_level)
+        return returns[returns <= var].mean()
+    
+    @staticmethod
+    def calculate_position_size(capital: float, price: float, 
+                              stop_loss: float, risk_per_trade: float = 0.01) -> int:
+        """Calculate position size based on risk"""
+        risk_per_share = abs(price - stop_loss)
         if risk_per_share <= 0:
             return 0
         
         max_risk = capital * risk_per_trade
         position_size = max_risk / risk_per_share
         return int(position_size)
-
-# Strategy 1: Moving Average Crossover
-class MACrossoverStrategy(BaseStrategy):
-    """Dual Moving Average Crossover Strategy"""
     
-    def init(self):
-        # Define parameters
-        self.short_window = self.params.get('short_window', 20)
-        self.long_window = self.params.get('long_window', 50)
-        self.atr_window = self.params.get('atr_window', 14)
-        
-        # Calculate indicators
-        self.short_ma = self.I(TechnicalIndicators.calculate_sma, 
-                              self.data.Close, self.short_window)
-        self.long_ma = self.I(TechnicalIndicators.calculate_sma, 
-                             self.data.Close, self.long_window)
-        self.atr = self.I(TechnicalIndicators.calculate_atr,
-                         self.data.High, self.data.Low, self.data.Close,
-                         self.atr_window)
-        
-    def next(self):
-        # Skip if we don't have enough data
-        if len(self.data) < self.long_window:
-            return
-        
-        current_price = self.data.Close[-1]
-        
-        # Check for crossover signals
-        if crossover(self.short_ma, self.long_ma):
-            # Bullish signal: Short MA crosses above Long MA
-            if not self.position:
-                # Calculate position size with risk management
-                stop_loss = self.set_stop_loss(current_price, self.atr[-1])
-                position_size = self.calculate_position_size(
-                    self.equity, current_price, stop_loss)
-                
-                if position_size > 0:
-                    self.buy(size=position_size, sl=stop_loss)
-        
-        elif crossover(self.long_ma, self.short_ma):
-            # Bearish signal: Short MA crosses below Long MA
-            if self.position:
-                self.position.close()
-
-# Strategy 2: RSI Mean Reversion
-class RSIStrategy(BaseStrategy):
-    """RSI Oversold/Overbought Mean Reversion Strategy"""
-    
-    def init(self):
-        # Define parameters
-        self.rsi_window = self.params.get('rsi_window', 14)
-        self.oversold = self.params.get('oversold', 30)
-        self.overbought = self.params.get('overbought', 70)
-        self.exit_level = self.params.get('exit_level', 50)
-        
-        # Calculate indicators
-        self.rsi = self.I(TechnicalIndicators.calculate_rsi,
-                         self.data.Close, self.rsi_window)
-        self.atr = self.I(TechnicalIndicators.calculate_atr,
-                         self.data.High, self.data.Low, self.data.Close, 14)
-        
-    def next(self):
-        if len(self.data) < self.rsi_window:
-            return
-        
-        current_price = self.data.Close[-1]
-        current_rsi = self.rsi[-1]
-        
-        # Entry signals
-        if not self.position:
-            if current_rsi < self.oversold:
-                # Oversold: Buy signal
-                stop_loss = self.set_stop_loss(current_price, self.atr[-1])
-                position_size = self.calculate_position_size(
-                    self.equity, current_price, stop_loss)
-                
-                if position_size > 0:
-                    self.buy(size=position_size, sl=stop_loss)
-                    
-            elif current_rsi > self.overbought:
-                # Overbought: Sell signal (short)
-                stop_loss = self.set_stop_loss(current_price, self.atr[-1])
-                position_size = self.calculate_position_size(
-                    self.equity, current_price, stop_loss)
-                
-                if position_size > 0:
-                    self.sell(size=position_size, sl=stop_loss * 1.02)  # Higher stop for shorts
-        
-        # Exit signals
-        elif self.position:
-            if self.position.is_long and current_rsi > self.exit_level:
-                self.position.close()
-            elif self.position.is_short and current_rsi < self.exit_level:
-                self.position.close()
-
-# Strategy 3: MACD Momentum
-class MACDStrategy(BaseStrategy):
-    """MACD Momentum Strategy with Signal Line Crossover"""
-    
-    def init(self):
-        # MACD parameters
-        self.fast = self.params.get('fast', 12)
-        self.slow = self.params.get('slow', 26)
-        self.signal = self.params.get('signal', 9)
-        
-        # Calculate MACD
-        macd_line, signal_line, histogram = TechnicalIndicators.calculate_macd(
-            self.data.Close, self.fast, self.slow, self.signal)
-        
-        self.macd = self.I(lambda: macd_line)
-        self.signal_line = self.I(lambda: signal_line)
-        self.histogram = self.I(lambda: histogram)
-        self.atr = self.I(TechnicalIndicators.calculate_atr,
-                         self.data.High, self.data.Low, self.data.Close, 14)
-        
-    def next(self):
-        if len(self.data) < self.slow:
-            return
-        
-        current_price = self.data.Close[-1]
-        
-        # Check for MACD crossover
-        if crossover(self.macd, self.signal_line):
-            # Bullish crossover
-            if not self.position or self.position.is_short:
-                if self.position:
-                    self.position.close()
-                
-                stop_loss = self.set_stop_loss(current_price, self.atr[-1])
-                position_size = self.calculate_position_size(
-                    self.equity, current_price, stop_loss)
-                
-                if position_size > 0:
-                    self.buy(size=position_size, sl=stop_loss)
-        
-        elif crossover(self.signal_line, self.macd):
-            # Bearish crossover
-            if not self.position or self.position.is_long:
-                if self.position:
-                    self.position.close()
-                
-                stop_loss = self.set_stop_loss(current_price, self.atr[-1])
-                position_size = self.calculate_position_size(
-                    self.equity, current_price, stop_loss)
-                
-                if position_size > 0:
-                    self.sell(size=position_size, sl=stop_loss * 1.02)
-
-# Strategy 4: Macro-Driven Strategy (Yield Curve + Inflation)
-class MacroStrategy(BaseStrategy):
-    """Macroeconomic strategy based on yield curve and inflation expectations"""
-    
-    def init(self):
-        # We need to pass macro data separately since Backtest expects single data source
-        # For simplicity, we'll use synthetic macro signals
-        self.yield_curve = self.I(self.calculate_yield_curve_signal)
-        self.inflation_signal = self.I(self.calculate_inflation_signal)
-        
-        # Technical indicators for timing
-        self.ma_200 = self.I(TechnicalIndicators.calculate_sma,
-                            self.data.Close, 200)
-        self.atr = self.I(TechnicalIndicators.calculate_atr,
-                         self.data.High, self.data.Low, self.data.Close, 14)
-        
-    def calculate_yield_curve_signal(self):
-        """Synthetic yield curve signal (10Y-2Y spread)"""
-        # In production, this would come from actual yield data
-        # Using random walk for demonstration
-        np.random.seed(42)
-        signal = np.random.randn(len(self.data.Close))
-        signal = pd.Series(signal, index=self.data.Close.index).rolling(30).mean()
-        return signal
-    
-    def calculate_inflation_signal(self):
-        """Synthetic inflation expectations signal"""
-        # In production, use TIPS breakevens or inflation swaps
-        np.random.seed(43)
-        signal = np.random.randn(len(self.data.Close))
-        signal = pd.Series(signal, index=self.data.Close.index).rolling(30).mean()
-        return signal
-    
-    def next(self):
-        if len(self.data) < 200:
-            return
-        
-        current_price = self.data.Close[-1]
-        ma_200 = self.ma_200[-1]
-        yield_signal = self.yield_curve[-1]
-        inflation_signal = self.inflation_signal[-1]
-        
-        # Macro trading rules
-        # Rule 1: Steepening yield curve + rising inflation = Buy commodities
-        # Rule 2: Flattening/inverting yield curve = Buy bonds/gold, sell equities
-        # Rule 3: Low inflation + steep curve = Buy equities
-        
-        is_bullish_commodities = (yield_signal > 0.5) and (inflation_signal > 0)
-        is_bearish_equities = (yield_signal < -0.5) or (inflation_signal < -1)
-        is_bullish_equities = (yield_signal > 0) and (inflation_signal > -0.5) and (current_price > ma_200)
-        
-        # Asset-specific logic (simplified)
-        asset_name = self.data._name if hasattr(self.data, '_name') else 'Unknown'
-        
-        if 'GLD' in asset_name or 'USO' in asset_name:
-            # Commodities: Buy when inflation rising
-            if not self.position and is_bullish_commodities:
-                stop_loss = self.set_stop_loss(current_price, self.atr[-1])
-                position_size = self.calculate_position_size(
-                    self.equity, current_price, stop_loss)
-                
-                if position_size > 0:
-                    self.buy(size=position_size, sl=stop_loss)
-            
-            elif self.position and not is_bullish_commodities:
-                self.position.close()
-        
-        elif 'SPY' in asset_name:
-            # Equities: More nuanced macro signals
-            if not self.position and is_bullish_equities and not is_bearish_equities:
-                stop_loss = self.set_stop_loss(current_price, self.atr[-1])
-                position_size = self.calculate_position_size(
-                    self.equity, current_price, stop_loss)
-                
-                if position_size > 0:
-                    self.buy(size=position_size, sl=stop_loss)
-            
-            elif self.position and (is_bearish_equities or not is_bullish_equities):
-                self.position.close()
-
-# ============================================================================
-# BACKTESTING ENGINE
-# ============================================================================
-
-class BacktestEngine:
-    """Main backtesting engine"""
-    
-    def __init__(self, initial_capital: float = 10000):
-        self.initial_capital = initial_capital
-        self.results = {}
-        self.trade_logs = {}
-        
-    def run_backtest(self, data: pd.DataFrame, strategy_class, 
-                    strategy_name: str, **kwargs) -> Dict:
-        """Run backtest for a single strategy"""
-        
-        # Extract OHLC data for backtesting.py
-        ohlc_data = data[['Open', 'High', 'Low', 'Close', 'Volume']]
-        ohlc_data.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-        
-        # Run backtest
-        bt = Backtest(
-            ohlc_data,
-            strategy_class,
-            cash=self.initial_capital,
-            commission=0.001,  # 0.1% commission
-            exclusive_orders=True
-        )
-        
-        # Run optimization if parameters provided
-        if 'params' in kwargs:
-            stats = bt.run(**kwargs['params'])
-        else:
-            stats = bt.run()
-        
-        # Store results
-        self.results[strategy_name] = {
-            'stats': stats,
-            'equity_curve': stats['_equity_curve'],
-            'trades': stats['_trades']
-        }
-        
-        return stats
-    
-    def run_all_strategies(self, data: pd.DataFrame, asset_name: str) -> Dict:
-        """Run all strategies on given data"""
-        
-        strategies = {
-            'MA_Crossover': (MACrossoverStrategy, {
-                'short_window': 20,
-                'long_window': 50,
-                'atr_window': 14
-            }),
-            'RSI_Strategy': (RSIStrategy, {
-                'rsi_window': 14,
-                'oversold': 30,
-                'overbought': 70,
-                'exit_level': 50
-            }),
-            'MACD_Strategy': (MACDStrategy, {
-                'fast': 12,
-                'slow': 26,
-                'signal': 9
-            }),
-            'Macro_Strategy': (MacroStrategy, {})
-        }
-        
-        all_results = {}
-        for name, (strategy_class, params) in strategies.items():
-            print(f"\nRunning {name} on {asset_name}...")
-            try:
-                stats = self.run_backtest(
-                    data,
-                    strategy_class,
-                    f"{asset_name}_{name}",
-                    params=params
-                )
-                all_results[name] = stats
-                
-                # Log trades
-                if not stats['_trades'].empty:
-                    self.trade_logs[f"{asset_name}_{name}"] = stats['_trades']
-                    print(f"  Trades: {len(stats['_trades'])}")
-                    print(f"  Return: {stats['Return [%]']:.2f}%")
-                    print(f"  Sharpe: {stats['Sharpe Ratio']:.2f}")
-                
-            except Exception as e:
-                print(f"Error running {name}: {e}")
-        
-        return all_results
-    
-    def calculate_portfolio_metrics(self, results_dict: Dict) -> pd.DataFrame:
-        """Calculate comprehensive performance metrics"""
-        metrics = []
-        
-        for strategy_name, stats in results_dict.items():
-            if isinstance(stats, dict):
-                # Calculate additional metrics
-                returns = stats['_equity_curve']['Equity'].pct_change().dropna()
-                
-                # Sortino Ratio (downside risk only)
-                downside_returns = returns[returns < 0]
-                downside_std = downside_returns.std() * np.sqrt(252) if len(downside_returns) > 0 else 0
-                sortino = (returns.mean() * 252) / downside_std if downside_std != 0 else 0
-                
-                # Max Drawdown
-                equity = stats['_equity_curve']['Equity']
-                rolling_max = equity.expanding().max()
-                drawdown = (equity - rolling_max) / rolling_max
-                max_dd = drawdown.min()
-                
-                # CAGR
-                years = len(equity) / 252
-                cagr = (equity.iloc[-1] / equity.iloc[0]) ** (1/years) - 1 if years > 0 else 0
-                
-                # Win rate
-                trades = stats['_trades']
-                if not trades.empty:
-                    win_rate = (trades['PnL'] > 0).mean() * 100
-                    avg_win = trades[trades['PnL'] > 0]['PnL'].mean() if len(trades[trades['PnL'] > 0]) > 0 else 0
-                    avg_loss = trades[trades['PnL'] < 0]['PnL'].mean() if len(trades[trades['PnL'] < 0]) > 0 else 0
-                    profit_factor = abs(avg_win / avg_loss) if avg_loss != 0 else np.inf
-                else:
-                    win_rate = avg_win = avg_loss = profit_factor = 0
-                
-                metrics.append({
-                    'Strategy': strategy_name,
-                    'Return %': stats['Return [%]'],
-                    'CAGR %': cagr * 100,
-                    'Sharpe': stats['Sharpe Ratio'],
-                    'Sortino': sortino,
-                    'Max Drawdown %': max_dd * 100,
-                    'Win Rate %': win_rate,
-                    'Profit Factor': profit_factor,
-                    'Total Trades': stats['# Trades'],
-                    'Avg Trade %': stats['Avg. Trade [%]']
-                })
-        
-        return pd.DataFrame(metrics).set_index('Strategy')
-    
-    def plot_results(self, results_dict: Dict, asset_name: str):
-        """Plot equity curves and drawdowns"""
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle(f'Backtest Results - {asset_name}', fontsize=16)
-        
-        # Equity curves
-        ax1 = axes[0, 0]
-        for strategy_name, stats in results_dict.items():
-            if isinstance(stats, dict):
-                equity = stats['_equity_curve']['Equity']
-                ax1.plot(equity.index, equity, label=strategy_name, linewidth=2)
-        ax1.set_title('Equity Curves')
-        ax1.set_ylabel('Portfolio Value ($)')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-        
-        # Drawdowns
-        ax2 = axes[0, 1]
-        for strategy_name, stats in results_dict.items():
-            if isinstance(stats, dict):
-                equity = stats['_equity_curve']['Equity']
-                rolling_max = equity.expanding().max()
-                drawdown = (equity - rolling_max) / rolling_max
-                ax2.fill_between(drawdown.index, drawdown * 100, 0, alpha=0.3, label=strategy_name)
-                ax2.plot(drawdown.index, drawdown * 100, alpha=0.8)
-        ax2.set_title('Drawdowns')
-        ax2.set_ylabel('Drawdown (%)')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-        
-        # Monthly returns heatmap
-        ax3 = axes[1, 0]
-        monthly_returns = []
-        strategy_names = []
-        for strategy_name, stats in results_dict.items():
-            if isinstance(stats, dict):
-                returns = stats['_equity_curve']['Equity'].pct_change().dropna()
-                monthly = returns.resample('M').apply(lambda x: (1 + x).prod() - 1)
-                monthly_returns.append(monthly.values * 100)
-                strategy_names.append(strategy_name)
-        
-        if monthly_returns:
-            monthly_df = pd.DataFrame(monthly_returns, index=strategy_names).T
-            monthly_df.index = monthly.index.strftime('%Y-%m')
-            im = ax3.imshow(monthly_df.T, aspect='auto', cmap='RdYlGn', vmin=-10, vmax=10)
-            ax3.set_yticks(range(len(strategy_names)))
-            ax3.set_yticklabels(strategy_names)
-            ax3.set_xticks(range(0, len(monthly_df), 6))
-            ax3.set_xticklabels(monthly_df.index[::6], rotation=45)
-            ax3.set_title('Monthly Returns (%)')
-            plt.colorbar(im, ax=ax3)
-        
-        # Trade analysis
-        ax4 = axes[1, 1]
-        trade_stats = []
-        for strategy_name, stats in results_dict.items():
-            if isinstance(stats, dict):
-                trades = stats['_trades']
-                if not trades.empty:
-                    winning_trades = trades[trades['PnL'] > 0]
-                    losing_trades = trades[trades['PnL'] < 0]
-                    
-                    trade_stats.append({
-                        'Strategy': strategy_name,
-                        'Win Rate': len(winning_trades) / len(trades) * 100,
-                        'Avg Win': winning_trades['PnL'].mean() if len(winning_trades) > 0 else 0,
-                        'Avg Loss': losing_trades['PnL'].mean() if len(losing_trades) > 0 else 0,
-                    })
-        
-        if trade_stats:
-            trade_df = pd.DataFrame(trade_stats)
-            x = np.arange(len(trade_df))
-            width = 0.35
-            
-            ax4.bar(x - width/2, trade_df['Win Rate'], width, label='Win Rate %', color='green', alpha=0.6)
-            ax4.bar(x + width/2, trade_df['Avg Win'], width, label='Avg Win $', color='blue', alpha=0.6)
-            
-            ax4.set_xlabel('Strategy')
-            ax4.set_title('Trade Statistics')
-            ax4.set_xticks(x)
-            ax4.set_xticklabels(trade_df['Strategy'], rotation=45)
-            ax4.legend()
-            ax4.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.show()
-    
-    def print_trade_log(self, strategy_name: str, num_trades: int = 10):
-        """Print detailed trade log"""
-        if strategy_name in self.trade_logs:
-            trades = self.trade_logs[strategy_name]
-            print(f"\n{'='*60}")
-            print(f"TRADE LOG: {strategy_name}")
-            print(f"{'='*60}")
-            print(f"Total Trades: {len(trades)}")
-            print(f"Win Rate: {(trades['PnL'] > 0).mean()*100:.1f}%")
-            print(f"Total PnL: ${trades['PnL'].sum():.2f}")
-            print(f"\nLast {min(num_trades, len(trades))} trades:")
-            print("-"*60)
-            
-            recent_trades = trades.tail(num_trades)
-            for idx, trade in recent_trades.iterrows():
-                direction = "BUY" if trade['Size'] > 0 else "SELL"
-                pnl_color = 'green' if trade['PnL'] > 0 else 'red'
-                print(f"{trade['EntryTime']}: {direction} {abs(trade['Size']):.0f} @ ${trade['EntryPrice']:.2f}")
-                print(f"  Exit: {trade['ExitTime']} @ ${trade['ExitPrice']:.2f}")
-                print(f"  PnL: ${trade['PnL']:.2f} ({trade['ReturnPct']*100:.2f}%)")
-                print(f"  Duration: {trade['Duration']}")
-                print("-"*40)
+    @staticmethod
+    def calculate_portfolio_var(returns_matrix: pd.DataFrame, 
+                              confidence_level: float = 0.95) -> float:
+        """Calculate portfolio VaR"""
+        portfolio_returns = returns_matrix.mean(axis=1)
+        return RiskManager.calculate_var(portfolio_returns, confidence_level)
 
 # ============================================================================
 # MAIN EXECUTION
@@ -696,147 +468,235 @@ def main():
     print("Multi-Asset, Multi-Strategy Backtesting Platform")
     print("="*70)
     
-    # Initialize
-    fetcher = DataFetcher(start_date="2015-01-01", end_date="2023-12-31")
-    engine = BacktestEngine(initial_capital=100000)
+    # Initialize components
+    fetcher = DataFetcher(start_date="2018-01-01", end_date="2023-12-31")
+    strategies = TradingStrategies()
+    engine = BacktestEngineVBT(initial_capital=100000, commission=0.001)
+    risk_manager = RiskManager()
     
     # Fetch data
     print("\n1. FETCHING MARKET DATA...")
     print("-"*50)
     
-    # Price data for our assets
-    symbols = ['GLD', 'USO', 'SPY']
-    price_data = fetcher.fetch_price_data(symbols)
+    # Try primary assets first, fall back to alternatives if needed
+    try:
+        price_data_dict = fetcher.fetch_price_data(fetcher.assets)
+        if len(price_data_dict) < 2:  # If we didn't get enough data
+            price_data_dict = fetcher.fetch_price_data(fetcher.alt_assets)
+    except:
+        price_data_dict = fetcher.fetch_price_data(fetcher.alt_assets)
     
-    if price_data.empty:
-        print("No data fetched. Exiting.")
+    if not price_data_dict:
+        print("Error: Could not fetch any market data.")
         return
     
-    # Fetch macro data
-    macro_data = fetcher.fetch_macro_data()
-    
-    # Calculate returns and indicators
-    returns_data = fetcher.calculate_returns(price_data)
-    
-    # Run backtests for each asset
+    # Process each asset
     all_metrics = {}
     
-    for symbol in symbols:
-        print(f"\n\n2. BACKTESTING {symbol}...")
+    for symbol, price_data in price_data_dict.items():
+        print(f"\n\n2. PROCESSING {symbol}...")
         print("="*50)
         
-        # Prepare data for this asset
-        asset_data = price_data[symbol].copy()
-        asset_data.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        # Create features
+        feature_data = fetcher.create_features(price_data)
         
-        # Run all strategies
-        results = engine.run_all_strategies(asset_data, symbol)
+        # Generate signals for each strategy
+        signals = {}
         
-        if results:
-            # Calculate metrics
-            metrics_df = engine.calculate_portfolio_metrics(results)
-            all_metrics[symbol] = metrics_df
+        # MA Crossover Strategy
+        signals['MA_Crossover'] = strategies.ma_crossover_strategy(
+            feature_data['Close'],
+            feature_data['SMA_20'],
+            feature_data['SMA_50']
+        )
+        
+        # RSI Strategy
+        signals['RSI'] = strategies.rsi_strategy(
+            feature_data['Close'],
+            feature_data['RSI'],
+            oversold=30,
+            overbought=70
+        )
+        
+        # MACD Strategy
+        signals['MACD'] = strategies.macd_strategy(
+            feature_data['Close'],
+            feature_data['MACD'],
+            feature_data['MACD_Signal']
+        )
+        
+        # Macro Strategy
+        signals['Macro'] = strategies.macro_strategy(
+            feature_data['Close'],
+            feature_data['Volatility_20d'],
+            feature_data['Volume_Ratio']
+        )
+        
+        # Run backtests for each strategy
+        strategy_results = {}
+        
+        for strategy_name, signal_series in signals.items():
+            print(f"\nRunning {strategy_name} strategy...")
             
-            # Display metrics
-            print(f"\nPerformance Metrics for {symbol}:")
-            print("-"*60)
-            print(metrics_df.round(2))
+            try:
+                # Run backtest
+                portfolio = engine.run_strategy(
+                    price_data=feature_data,
+                    signals=signal_series,
+                    strategy_name=f"{symbol}_{strategy_name}",
+                    stop_loss_pct=0.03,  # 3% stop loss
+                    take_profit_pct=0.06  # 6% take profit
+                )
+                
+                # Calculate metrics
+                metrics = engine.calculate_performance_metrics(portfolio)
+                strategy_results[strategy_name] = {
+                    'portfolio': portfolio,
+                    'metrics': metrics
+                }
+                
+                print(f"  Total Return: {metrics['Total Return (%)']:.2f}%")
+                print(f"  Sharpe Ratio: {metrics['Sharpe Ratio']:.2f}")
+                print(f"  Max Drawdown: {metrics['Max Drawdown (%)']:.2f}%")
+                
+                # Generate trade report for top strategies
+                if strategy_name in ['MA_Crossover', 'RSI']:
+                    engine.generate_trade_report(portfolio, f"{symbol}_{strategy_name}")
+                    
+            except Exception as e:
+                print(f"  Error running {strategy_name}: {e}")
+        
+        # Store all results for this asset
+        all_metrics[symbol] = strategy_results
+        
+        # Plot comparison
+        if strategy_results:
+            # Extract portfolio objects for comparison
+            portfolios_dict = {}
+            for strat_name, result in strategy_results.items():
+                if 'portfolio' in result:
+                    portfolios_dict[strat_name] = {'portfolio': result['portfolio']}
             
-            # Plot results
-            engine.plot_results(results, symbol)
-            
-            # Show sample trade log for best performing strategy
-            if not metrics_df.empty:
-                best_strategy = metrics_df['Return %'].idxmax()
-                engine.print_trade_log(f"{symbol}_{best_strategy}", num_trades=5)
+            if portfolios_dict:
+                engine.plot_compare_strategies(portfolios_dict, symbol)
     
     # Portfolio-level analysis
     print("\n\n3. PORTFOLIO-LEVEL ANALYSIS")
     print("="*70)
     
-    # Combine all metrics
-    combined_metrics = pd.concat(all_metrics, names=['Asset', 'Strategy'])
-    print("\nAll Strategy Performance:")
-    print("-"*70)
-    print(combined_metrics.round(2))
+    # Create summary table
+    summary_data = []
     
-    # Risk Analysis
-    print("\n\n4. RISK ANALYSIS")
-    print("="*70)
-    
-    # Correlation analysis (simplified)
-    print("\nKey Risk Metrics:")
-    print("-"*50)
-    
-    risk_metrics = []
-    for symbol in symbols:
-        if symbol in all_metrics:
-            df = all_metrics[symbol]
-            for strategy in df.index:
-                metrics = df.loc[strategy]
-                risk_metrics.append({
-                    'Asset_Strategy': f"{symbol}_{strategy}",
-                    'Max_DD': metrics['Max Drawdown %'],
-                    'Sharpe': metrics['Sharpe'],
-                    'Sortino': metrics['Sortino'],
-                    'Win_Rate': metrics['Win Rate %']
+    for symbol, strategies in all_metrics.items():
+        for strategy_name, result in strategies.items():
+            if 'metrics' in result:
+                metrics = result['metrics']
+                summary_data.append({
+                    'Asset': symbol,
+                    'Strategy': strategy_name,
+                    'Return (%)': metrics['Total Return (%)'],
+                    'CAGR (%)': metrics.get('CAGR (%)', 0),
+                    'Sharpe': metrics['Sharpe Ratio'],
+                    'Sortino': metrics.get('Sortino Ratio', 0),
+                    'Max DD (%)': metrics['Max Drawdown (%)'],
+                    'Win Rate (%)': metrics['Win Rate (%)'],
+                    'Profit Factor': metrics.get('Profit Factor', 0),
+                    'Trades': metrics['Total Trades']
                 })
     
-    risk_df = pd.DataFrame(risk_metrics)
-    
-    # Identify best strategies by different metrics
-    print("\nBest by Sharpe Ratio:")
-    print(risk_df.nlargest(3, 'Sharpe')[['Asset_Strategy', 'Sharpe', 'Max_DD']])
-    
-    print("\nBest by Sortino Ratio:")
-    print(risk_df.nlargest(3, 'Sortino')[['Asset_Strategy', 'Sortino', 'Max_DD']])
-    
-    print("\nBest by Win Rate:")
-    print(risk_df.nlargest(3, 'Win_Rate')[['Asset_Strategy', 'Win_Rate', 'Max_DD']])
-    
-    # Drawdown analysis
-    print("\nDrawdown Analysis:")
-    print(f"Maximum Drawdown among all strategies: {risk_df['Max_DD'].min():.1f}%")
-    print(f"Average Drawdown: {risk_df['Max_DD'].mean():.1f}%")
+    if summary_data:
+        summary_df = pd.DataFrame(summary_data)
+        print("\nPerformance Summary:")
+        print("-"*70)
+        print(summary_df.round(2).to_string())
+        
+        # Save results
+        summary_df.to_csv('backtest_summary.csv', index=False)
+        print("\nResults saved to 'backtest_summary.csv'")
+        
+        # Risk Analysis
+        print("\n\n4. RISK ANALYSIS")
+        print("="*70)
+        
+        # Calculate correlation matrix of strategy returns
+        returns_data = {}
+        for symbol, strategies in all_metrics.items():
+            for strategy_name, result in strategies.items():
+                if 'portfolio' in result:
+                    key = f"{symbol}_{strategy_name}"
+                    returns_data[key] = result['portfolio'].returns()
+        
+        if returns_data:
+            returns_df = pd.DataFrame(returns_data)
+            
+            print("\nStrategy Returns Correlation Matrix:")
+            print("-"*50)
+            corr_matrix = returns_df.corr()
+            print(corr_matrix.round(2).to_string())
+            
+            # Plot correlation heatmap
+            plt.figure(figsize=(10, 8))
+            sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0, 
+                       square=True, linewidths=0.5)
+            plt.title('Strategy Returns Correlation Matrix')
+            plt.tight_layout()
+            plt.show()
+        
+        # Identify best strategies
+        print("\n\n5. BEST PERFORMING STRATEGIES")
+        print("="*70)
+        
+        # By Sharpe Ratio
+        print("\nTop 3 by Sharpe Ratio:")
+        sharpe_top = summary_df.nlargest(3, 'Sharpe')[['Asset', 'Strategy', 'Sharpe', 'Return (%)']]
+        print(sharpe_top.to_string(index=False))
+        
+        # By Return
+        print("\nTop 3 by Total Return:")
+        return_top = summary_df.nlargest(3, 'Return (%)')[['Asset', 'Strategy', 'Return (%)', 'Max DD (%)']]
+        print(return_top.to_string(index=False))
+        
+        # By Win Rate
+        print("\nTop 3 by Win Rate:")
+        winrate_top = summary_df.nlargest(3, 'Win Rate (%)')[['Asset', 'Strategy', 'Win Rate (%)', 'Trades']]
+        print(winrate_top.to_string(index=False))
     
     # Strategic Insights
-    print("\n\n5. STRATEGIC INSIGHTS & RECOMMENDATIONS")
+    print("\n\n6. STRATEGIC INSIGHTS & RECOMMENDATIONS")
     print("="*70)
     print("""
-    Key Observations:
-    1. Technical strategies perform differently across asset classes
-    2. MA Crossover tends to work well in trending markets
-    3. RSI is effective in range-bound, mean-reverting markets
-    4. MACD captures momentum shifts but may generate false signals
-    5. Macro strategy requires accurate economic data for optimal results
+    Key Findings:
+    1. Trend-following strategies (MA Crossover) perform well in strong trending markets
+    2. Mean-reversion strategies (RSI) excel during range-bound periods
+    3. Momentum strategies (MACD) capture intermediate trends but may whipsaw
+    4. Macro strategies require accurate regime detection
     
-    Risk Mitigation Techniques Implemented:
-    • Dynamic stop-loss based on ATR (volatility-adjusted)
-    • Kelly-inspired position sizing
-    • Maximum risk per trade (1-2% of capital)
-    • Take-profit levels based on risk-reward ratios
+    Risk Management Insights:
+    • Stop-losses at 3% and take-profit at 6% provide good risk-reward
+    • Position sizing should adapt to market volatility (use ATR)
+    • Diversify across uncorrelated strategies and assets
     
-    Recommendations:
-    1. Use MA Crossover for Gold (GLD) in clear trends
-    2. Apply RSI strategy for Oil (USO) during consolidation
-    3. Combine MACD with volume confirmation for S&P 500
-    4. Macro strategy works best with real-time economic data
-    5. Consider correlation between assets for portfolio construction
+    Implementation Recommendations:
+    1. Use MA Crossover for Gold and Oil during clear trends
+    2. Apply RSI strategy for equity indices during consolidation
+    3. Combine MACD with volume confirmation for better signals
+    4. Use macro overlays to adjust position sizing
+    
+    Next Steps:
+    1. Incorporate machine learning for signal improvement
+    2. Add transaction cost models and slippage
+    3. Implement walk-forward optimization
+    4. Add real-time data integration
     """)
-    
-    # Save results
-    print("\n6. SAVING RESULTS...")
-    combined_metrics.to_csv('backtest_results.csv')
-    print("Results saved to 'backtest_results.csv'")
     
     print("\n" + "="*70)
     print("BACKTESTING COMPLETE")
     print("="*70)
 
 # ============================================================================
-# EXECUTION
+# RUN THE SYSTEM
 # ============================================================================
 
 if __name__ == "__main__":
-    # Run the main function
+    # Execute main function
     main()
